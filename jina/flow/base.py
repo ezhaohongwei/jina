@@ -6,14 +6,15 @@ import re
 import threading
 import uuid
 import warnings
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
 from contextlib import ExitStack
 from typing import Optional, Union, Tuple, List, Set, Dict
+from google.protobuf import json_format
 
 from .builder import build_required, _build_flow, _hanging_pods
 from .. import __default_host__
 from ..clients import Client, WebSocketClient
-from ..enums import FlowBuildLevel, PodRoleType, FlowInspectType
+from ..enums import FlowBuildLevel, PodRoleType, FlowInspectType, SocketType
 from ..excepts import FlowTopologyError, FlowMissingPodError
 from ..helper import (
     colored,
@@ -27,11 +28,14 @@ from ..jaml import JAMLCompatible
 from ..logging.logger import JinaLogger
 from ..parsers import set_client_cli_parser, set_gateway_parser, set_pod_parser
 
+from ..types.routing.graph import RoutingGraph
+
 __all__ = ['BaseFlow']
 
 from ..peapods import Pod
 from ..peapods.pods.compound import CompoundPod
 from ..peapods.pods.factory import PodFactory
+from ..proto import jina_pb2
 
 
 class FlowType(type(ExitStack), type(JAMLCompatible)):
@@ -44,6 +48,9 @@ _regex_port = r'(.*?):([0-9]{1,4}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|6
 
 if False:
     from ..peapods import BasePod
+
+
+GATEWAY_NAME = 'gateway'
 
 
 class BaseFlow(JAMLCompatible, ExitStack, metaclass=FlowType):
@@ -82,7 +89,7 @@ class BaseFlow(JAMLCompatible, ExitStack, metaclass=FlowType):
         self._inspect_pods = {}  # type: Dict[str, str]
         self._build_level = FlowBuildLevel.EMPTY
         self._last_changed_pod = [
-            'gateway'
+            GATEWAY_NAME
         ]  #: default first pod is gateway, will add when build()
         self._update_args(args, **kwargs)
         self._env = env
@@ -162,11 +169,9 @@ class BaseFlow(JAMLCompatible, ExitStack, metaclass=FlowType):
         self._build_level = FlowBuildLevel.EMPTY
 
     def _add_gateway(self, needs, **kwargs):
-        pod_name = 'gateway'
-
         kwargs.update(
             dict(
-                name=pod_name,
+                name=GATEWAY_NAME,
                 ctrl_with_ipc=True,  # otherwise ctrl port would be conflicted
                 runtime_cls='GRPCRuntime'
                 if self._cls_client == Client
@@ -179,7 +184,7 @@ class BaseFlow(JAMLCompatible, ExitStack, metaclass=FlowType):
         kwargs.update(self._common_kwargs)
         args = ArgNamespace.kwargs2namespace(kwargs, set_gateway_parser())
 
-        self._pod_nodes[pod_name] = Pod(args, needs)
+        self._pod_nodes[GATEWAY_NAME] = Pod(args, needs)
 
     def needs(
         self, needs: Union[Tuple[str], List[str]], name: str = 'joiner', *args, **kwargs
@@ -393,6 +398,76 @@ class BaseFlow(JAMLCompatible, ExitStack, metaclass=FlowType):
             # no inspect node is in the graph, return the current graph
             return self
 
+    def _get_gateway_target(self, prefix):
+        gateway_pod = self._pod_nodes[GATEWAY_NAME]
+        return (
+            f'{prefix}-{GATEWAY_NAME}',
+            {
+                'pod_address': gateway_pod.full_address,
+                'expected_parts': 0,
+            },
+        )
+
+    def _update_port_type(self, pod):
+        pod.head_args.socket_in = SocketType.ROUTER_BIND
+        pod.tail_args.dynamic_out_routing = True
+        pod.tail_args.socket_out = SocketType.DEALER_CONNECT
+
+    def _get_routing_graph(self):
+        target_pods = [
+            (
+                pod_id,
+                {
+                    'pod_address': pod.full_address,
+                    'expected_parts': 0,
+                },
+            )
+            for pod_id, pod in self._pod_nodes.items()
+            if pod_id != GATEWAY_NAME
+        ]
+        target_pods = (
+            [self._get_gateway_target('start')]
+            + target_pods
+            + [self._get_gateway_target('end')]
+        )
+
+        pods_id_to_position = {
+            pod_id: (position, pod)
+            for position, (pod_id, pod) in enumerate(target_pods)
+        }
+
+        edges = defaultdict(list)
+        for end, pod in self._pod_nodes.items():
+            self._update_port_type(pod)
+            if end == GATEWAY_NAME:
+                end = f'end-{GATEWAY_NAME}'
+
+            for start in pod.needs:
+                if start == GATEWAY_NAME:
+                    start = f'start-{GATEWAY_NAME}'
+
+                if start not in pods_id_to_position:
+                    raise FlowMissingPodError(
+                        f'{start} is not in this flow, misspelled name?'
+                    )
+
+                end_pod = pods_id_to_position[end]
+                end_pod[1]['expected_parts'] += 1
+                start_pos = pods_id_to_position[start][0]
+                end_pos = end_pod[0]
+                edges[str(start_pos)].append(str(end_pos))
+
+        targets = [pod[1] for pod in target_pods]
+        graph = {'active_pod_index': '0', 'pods': targets, 'edges': edges}
+
+        routing_pb = jina_pb2.RoutingGraphProto()
+        json_format.ParseDict(graph, routing_pb)
+        return RoutingGraph(routing_pb)
+
+    def _init_dynamic_routing(self):
+        routing_graph = self._get_routing_graph()
+        self._pod_nodes[GATEWAY_NAME].add_routing_graph(routing_graph)
+
     def build(self, copy_flow: bool = False) -> 'BaseFlow':
         """
         Build the current Flow and make it ready to use
@@ -427,11 +502,8 @@ class BaseFlow(JAMLCompatible, ExitStack, metaclass=FlowType):
         if op_flow.args.inspect == FlowInspectType.COLLECT:
             op_flow.gather_inspect(copy_flow=False)
 
-        if 'gateway' not in op_flow._pod_nodes:
+        if GATEWAY_NAME not in op_flow._pod_nodes:
             op_flow._add_gateway(needs={op_flow.last_pod})
-
-        # construct a map with a key a start node and values an array of its end nodes
-        _outgoing_map = defaultdict(list)
 
         # if set no_inspect then all inspect related nodes are removed
         if op_flow.args.inspect == FlowInspectType.REMOVE:
@@ -451,14 +523,8 @@ class BaseFlow(JAMLCompatible, ExitStack, metaclass=FlowType):
             else:
                 pod.needs = set(reverse_inspect_map.get(ep, ep) for ep in pod.needs)
 
-            for start in pod.needs:
-                if start not in op_flow._pod_nodes:
-                    raise FlowMissingPodError(
-                        f'{start} is not in this flow, misspelled name?'
-                    )
-                _outgoing_map[start].append(end)
+        op_flow._init_dynamic_routing()
 
-        op_flow = _build_flow(op_flow, _outgoing_map)
         hanging_pods = _hanging_pods(op_flow)
         if hanging_pods:
             op_flow.logger.warning(
@@ -507,8 +573,8 @@ class BaseFlow(JAMLCompatible, ExitStack, metaclass=FlowType):
         if self._env:
             for k in self._env.keys():
                 os.unsetenv(k)
-        if 'gateway' in self._pod_nodes:
-            self._pod_nodes.pop('gateway')
+        if GATEWAY_NAME in self._pod_nodes:
+            self._pod_nodes.pop(GATEWAY_NAME)
         self._build_level = FlowBuildLevel.EMPTY
         self.logger.success(
             f'flow is closed and all resources are released, current build level is {self._build_level}'
@@ -827,7 +893,7 @@ class BaseFlow(JAMLCompatible, ExitStack, metaclass=FlowType):
 
 
         .. # noqa: DAR201"""
-        return self._pod_nodes['gateway'].port_expose
+        return self._pod_nodes[GATEWAY_NAME].port_expose
 
     @property
     @build_required(FlowBuildLevel.GRAPH)
@@ -836,7 +902,7 @@ class BaseFlow(JAMLCompatible, ExitStack, metaclass=FlowType):
 
 
         .. # noqa: DAR201"""
-        return self._pod_nodes['gateway'].host
+        return self._pod_nodes[GATEWAY_NAME].host
 
     @property
     @build_required(FlowBuildLevel.GRAPH)
@@ -860,7 +926,7 @@ class BaseFlow(JAMLCompatible, ExitStack, metaclass=FlowType):
         return self._pod_nodes.items().__iter__()
 
     def _show_success_message(self):
-        if self._pod_nodes['gateway'].args.restful:
+        if self._pod_nodes[GATEWAY_NAME].args.restful:
             header = 'http://'
             protocol = 'REST'
         else:
@@ -922,16 +988,16 @@ class BaseFlow(JAMLCompatible, ExitStack, metaclass=FlowType):
 
         # Flow is build to graph already
         if self._build_level >= FlowBuildLevel.GRAPH:
-            self['gateway'].args.restful = restful
-            self['gateway'].args.runtime_cls = gateway
+            self[GATEWAY_NAME].args.restful = restful
+            self[GATEWAY_NAME].args.runtime_cls = gateway
             if port:
-                self['gateway'].args.port_expose = port
+                self[GATEWAY_NAME].args.port_expose = port
 
         # Flow is running already, then close the existing gateway
         if self._build_level >= FlowBuildLevel.RUNNING:
-            self['gateway'].close()
-            self.enter_context(self['gateway'])
-            self['gateway'].wait_start_success()
+            self[GATEWAY_NAME].close()
+            self.enter_context(self[GATEWAY_NAME])
+            self[GATEWAY_NAME].wait_start_success()
 
     def use_rest_gateway(self, port: Optional[int] = None):
         """Change to use REST gateway for IO.
@@ -952,7 +1018,7 @@ class BaseFlow(JAMLCompatible, ExitStack, metaclass=FlowType):
             raise TypeError(f'{typename(item)} is not supported')
 
     def _update_client(self):
-        if self._pod_nodes['gateway'].args.restful:
+        if self._pod_nodes[GATEWAY_NAME].args.restful:
             self._cls_client = WebSocketClient
 
     @property

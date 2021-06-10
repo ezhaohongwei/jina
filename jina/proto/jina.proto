@@ -149,12 +149,12 @@ message RouteProto {
 message TargetPodProto{
     string pod_address = 1; // the zmq address of the BasePod
     uint32 expected_parts = 2; // the number of parts, the pod should expect
-    repeated uint32 out_edges = 3; // numbers in RoutingGraphProto.pods
 }
 
 message RoutingGraphProto {
     repeated TargetPodProto pods = 1;
-    uint32 active_pod_index = 2;
+    google.protobuf.Struct edges = 2;
+    string active_pod_index = 3;
 }
 
 /**
@@ -206,7 +206,7 @@ message EnvelopeProto {
 
     repeated RouteProto routes = 10; // status info on every routes
 
-    RoutingGraphProto targets = 13;
+    RoutingGraphProto routing_graph = 13;
 
     StatusProto status = 11; // status info
 

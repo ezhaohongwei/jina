@@ -96,6 +96,12 @@ def set_gateway_parser(parser=None):
         default=False,
         help='If set, use RESTful interface instead of gRPC as the main interface',
     )
+
+    parser.add_argument(
+        '--routing-graph',
+        default=None,
+        help='Routing graph for the gateway',
+    )
     return parser
 
 

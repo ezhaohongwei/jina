@@ -353,6 +353,13 @@ class Pod(BasePod):
             self.peas_args = self._parse_args(args)
         self._activated = False
 
+    def add_routing_graph(self, routing_graph):
+        self.args.routing_graph = routing_graph
+
+    @property
+    def full_address(self):
+        return f'{self.head_args.host_in}:{self.head_args.port_in}'
+
     @property
     def is_singleton(self) -> bool:
         """Return if the Pod contains only a single Pea

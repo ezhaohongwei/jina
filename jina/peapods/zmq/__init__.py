@@ -263,7 +263,7 @@ class Zmqlet:
         return out_sock
 
     def get_dynamic_next_routes(self, message):
-        routing_graph = RoutingGraph(message.envelope.targets)
+        routing_graph = RoutingGraph(message.envelope.routing_graph)
         next_targets = routing_graph.get_next_targets()
         next_routes = []
         for target in next_targets:
@@ -277,7 +277,7 @@ class Zmqlet:
     def send_message_dynamic(self, msg: 'Message'):
         for routing_graph, out_sock in self.get_dynamic_next_routes(msg):
             new_message_proto = msg.proto
-            new_message_proto.envelope.targets.CopyFrom(routing_graph.proto)
+            new_message_proto.envelope.routing_graph.CopyFrom(routing_graph.proto)
 
             self._send_message_via(out_sock, Message.from_proto(new_message_proto))
 
@@ -369,7 +369,7 @@ class AsyncZmqlet(Zmqlet):
     async def send_message_dynamic(self, msg: 'Message'):
         for routing_graph, out_sock in self.get_dynamic_next_routes(msg):
             new_message_proto = msg.proto
-            new_message_proto.envelope.targets.CopyFrom(routing_graph.proto)
+            new_message_proto.envelope.routing_graph.CopyFrom(routing_graph.proto)
             await self._send_message_via(
                 out_sock, Message.from_proto(new_message_proto)
             )
