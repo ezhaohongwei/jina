@@ -65,6 +65,8 @@ class Zmqlet:
         self.in_sock_type = self.in_sock.type
         if self.out_sock is not None:
             self.out_sock_type = self.out_sock.type
+        else:
+            self.out_sock_type = zmq.DEALER
         self.ctrl_sock_type = self.ctrl_sock.type
         self._register_pollin()
         self.opened_socks.extend([self.in_sock, self.ctrl_sock])
